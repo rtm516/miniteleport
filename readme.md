@@ -34,3 +34,6 @@ Minimal zero-configuration server-side teleport commands.
 Requires the [Fabric API](https://modrinth.com/mod/fabric-api).
 Drop the mod `.jar` into your `mods` folder.
 No configuration required.
+
+## Supported maps
+- [Pl3x Map](https://modrinth.com/plugin/pl3xmap)
