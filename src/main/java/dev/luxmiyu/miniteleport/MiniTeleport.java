@@ -1,31 +1,28 @@
 package dev.luxmiyu.miniteleport;
 
+import dev.luxmiyu.miniteleport.maphandlers.EmptyMapHandler;
+import dev.luxmiyu.miniteleport.maphandlers.IMapHandler;
+import dev.luxmiyu.miniteleport.maphandlers.pl3x.Pl3xMapHandler;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerWorldEvents;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 
-import net.minecraft.world.GameRules;
+import net.minecraft.command.DefaultPermissions;
+import net.minecraft.command.permission.Permission;
+import net.minecraft.command.permission.PermissionLevel;
 import net.minecraft.util.Formatting;
-import net.minecraft.util.Identifier;
-import net.minecraft.util.WorldSavePath;
 import net.minecraft.world.WorldProperties;
-import net.minecraft.particle.ParticleTypes;
-import net.minecraft.registry.RegistryKeys;
-import net.minecraft.registry.RegistryKey;
-import net.minecraft.sound.SoundCategory;
-import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.text.ClickEvent;
 import net.minecraft.text.HoverEvent;
-import net.minecraft.text.MutableText;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.command.argument.EntityArgumentType;
-import net.minecraft.network.packet.s2c.play.PositionFlag;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.context.CommandContext;
@@ -33,234 +30,27 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import net.minecraft.world.rule.GameRules;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.List;
 import java.util.UUID;
-import java.util.EnumSet;
-import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.function.Predicate;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import org.jetbrains.annotations.Nullable;
 
 public class MiniTeleport implements ModInitializer {
-    static final String MOD_ID = "miniteleport";
-    static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
-    static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
-    static final Predicate<ServerCommandSource> PERMISSIONS_NORMAL = source -> source.hasPermissionLevel(0);
-    static final Predicate<ServerCommandSource> PERMISSIONS_ADMIN = source -> source.hasPermissionLevel(4);
+    static final Predicate<ServerCommandSource> PERMISSIONS_NORMAL = source -> true;
+    static final Predicate<ServerCommandSource> PERMISSIONS_ADMIN = source -> source.getPermissions().hasPermission(DefaultPermissions.OWNERS);
 
     static final long REQUEST_TIMEOUT_MS = 60_000; // 60 seconds
 
-    record Warp(String name, int x, int y, int z, String dimension) {
-    }
-
-    record TeleportRequest(UUID sender, UUID receiver, boolean here, long expiry) {
-    }
-
     final List<TeleportRequest> pendingRequests = new CopyOnWriteArrayList<>();
 
-    // ------ WARPS ----------------------------------------------------------------------------------------------
+    private IMapHandler mapHandler;
 
-    Path getDir(MinecraftServer server) {
-        return server.getSavePath(WorldSavePath.ROOT).resolve(MOD_ID);
-    }
-
-    File getFile(MinecraftServer server, @Nullable UUID uuid) {
-        Path worldDir = getDir(server);
-        Path path = (uuid == null) ? worldDir.resolve("warps.json") : worldDir.resolve("homes/" + uuid + ".json");
-        return path.toFile();
-    }
-
-    void createDir(MinecraftServer server) {
-        try {
-            Files.createDirectories(getDir(server).resolve("homes"));
-        } catch (IOException e) {
-            LOGGER.error("Failed to create data directory", e);
-        }
-    }
-
-    Warp[] getWarps(File file) {
-        if (!file.exists()) return new Warp[0];
-
-        try (FileReader reader = new FileReader(file)) {
-            return GSON.fromJson(reader, Warp[].class);
-        } catch (IOException e) {
-            LOGGER.error("Failed to load warps from {}", file, e);
-            return new Warp[0];
-        }
-    }
-
-    @Nullable Warp getWarp(MinecraftServer server, String name, @Nullable UUID uuid) {
-        for (Warp warp : getWarps(getFile(server, uuid))) {
-            if (warp.name().equals(name)) return warp;
-        }
-        return null;
-    }
-
-    void writeFile(File file, Object object) {
-        try {
-            Files.createDirectories(file.getParentFile().toPath());
-
-            Path tempFile = Files.createTempFile(file.getParentFile().toPath(), "tmp-", ".json");
-            try (FileWriter writer = new FileWriter(tempFile.toFile())) {
-                GSON.toJson(object, writer);
-            }
-
-            Files.move(
-                tempFile,
-                file.toPath(),
-                StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE
-            );
-        } catch (IOException e) {
-            LOGGER.error("Failed to save warps to {}", file, e);
-        }
-    }
-
-    void setWarp(String name, ServerPlayerEntity player, @Nullable UUID uuid) {
-        MinecraftServer server = player.getEntityWorld().getServer();
-        ArrayList<Warp> warps = new ArrayList<>(List.of(getWarps(getFile(server, uuid))));
-        String dimension = player.getEntityWorld().getRegistryKey().getValue().toString();
-        Warp warp = new Warp(name, (int) Math.floor(player.getX()), (int) Math.floor(player.getY()),
-            (int) Math.floor(player.getZ()), dimension);
-
-        boolean warpExists = false;
-        for (int i = 0; i < warps.size(); i++) {
-            if (warps.get(i).name().equals(name)) {
-                warps.set(i, warp);
-                warpExists = true;
-            }
-        }
-
-        if (!warpExists) {
-            warps.add(warp);
-        }
-
-        CompletableFuture.runAsync(() -> writeFile(getFile(server, uuid), warps));
-    }
-
-    int delWarp(String name, ServerPlayerEntity player, @Nullable UUID uuid) {
-        MinecraftServer server = player.getEntityWorld().getServer();
-        ArrayList<Warp> warps = new ArrayList<>(List.of(getWarps(getFile(server, uuid))));
-
-        int delIndex = -1;
-        for (int i = 0; i < warps.size(); i++) {
-            if (warps.get(i).name().equals(name)) {
-                delIndex = i;
-                break;
-            }
-        }
-
-        String start = uuid == null ? "Warp '" : "Home '";
-
-        if (delIndex == -1) {
-            player.sendMessage(
-                Text.literal(start + name + "' does not exist!").formatted(Formatting.RED),
-                false);
-            return 0;
-        } else {
-            warps.remove(delIndex);
-            CompletableFuture.runAsync(() -> writeFile(getFile(server, uuid), warps));
-
-            player.sendMessage(
-                Text.literal(start + name + "' deleted!").formatted(Formatting.AQUA), false);
-            return 1;
-        }
-    }
-
-    void doTeleportEffect(ServerWorld world, ServerPlayerEntity player) {
-        world.playSound(
-            null,
-            player.getBlockX() + 0.5,
-            player.getBlockY() + 0.5,
-            player.getBlockZ() + 0.5,
-            SoundEvents.ENTITY_ENDERMAN_TELEPORT,
-            SoundCategory.PLAYERS,
-            1.0f,
-            1.0f
-        );
-
-        world.spawnParticles(
-            ParticleTypes.PORTAL,
-            player.getBlockX() + 0.5,
-            player.getBlockY() + 0.5,
-            player.getBlockZ() + 0.5,
-            25,
-            0.25, 0.25, 0.25,
-            0.0
-        );
-    }
-
-    int warpPlayer(ServerPlayerEntity player, @Nullable Warp warp) {
-        if (warp == null) {
-            player.sendMessage(Text.literal("That warp doesn't exist!").formatted(Formatting.RED), false);
-            return 0;
-        }
-
-        ServerWorld world = player.getEntityWorld().getServer()
-            .getWorld(RegistryKey.of(RegistryKeys.WORLD, Identifier.of(warp.dimension())));
-        if (world == null) {
-            player.sendMessage(Text.literal("That dimension doesn't exist!").formatted(Formatting.RED), false);
-            return 0;
-        }
-
-        setWarp("back", player, player.getUuid());
-
-        player.teleport(world, warp.x() + 0.5, warp.y() + 0.1, warp.z() + 0.5, EnumSet.noneOf(PositionFlag.class),
-            player.getYaw(), player.getPitch(), true);
-
-        doTeleportEffect(world, player);
-
-        if (List.of("home", "back").contains(warp.name())) {
-            player.sendMessage(
-                Text.literal(String.format("Teleported %s!", warp.name())).formatted(Formatting.AQUA),
-                false
-            );
-        } else {
-            player.sendMessage(
-                Text.literal(String.format("Teleported to %s!", warp.name())).formatted(Formatting.AQUA),
-                false
-            );
-        }
-
-        return 1;
-    }
-
-    Text listWarps(MinecraftServer server, @Nullable UUID uuid) {
-        Warp[] warps = getWarps(getFile(server, uuid));
-
-        if (warps.length == 0) {
-            return Text.literal(uuid == null ? "There are no warps." : "You have no homes.").formatted(Formatting.RED);
-        }
-
-        MutableText text = Text.literal(uuid == null ? "Warps:" : "Homes:");
-        for (Warp warp : warps) {
-            text
-                .append(Text.literal(" "))
-                .append(Text.literal(warp.name()).formatted(Formatting.GOLD).styled(style -> style
-                        .withClickEvent(new ClickEvent.RunCommand((uuid == null ? "/warp " : "/home ") + warp.name()))
-                        .withHoverEvent(new HoverEvent.ShowText(Text.literal("Teleport to " + warp.name())))
-                    )
-                );
-        }
-        return text;
-    }
-
+    //region REQUESTS
     // ------ REQUESTS -------------------------------------------------------------------------------------------
 
     void addRequest(TeleportRequest request) {
@@ -371,12 +161,12 @@ public class MiniTeleport implements ModInitializer {
         }
 
         if (request.here()) {
-            warpPlayer(receiver,
+            WarpManager.warpPlayer(receiver,
                 new Warp(actualSender.getName().getString(), (int) actualSender.getX(), (int) actualSender.getY(),
                     (int) actualSender.getZ(), actualSender.getEntityWorld().getRegistryKey().getValue().toString()));
             actualSender.sendMessage(Text.literal("Teleport request accepted!").formatted(Formatting.AQUA), false);
         } else {
-            warpPlayer(actualSender,
+            WarpManager.warpPlayer(actualSender,
                 new Warp(receiver.getName().getString(), (int) receiver.getX(), (int) receiver.getY(),
                     (int) receiver.getZ(), receiver.getEntityWorld().getRegistryKey().getValue().toString()));
             receiver.sendMessage(Text.literal("Teleport request accepted!").formatted(Formatting.AQUA), false);
@@ -412,7 +202,9 @@ public class MiniTeleport implements ModInitializer {
 
         removeRequest(request);
     }
+    //endregion
 
+    //region COMMANDS
     // ------ COMMANDS ----------------------------------------------------------------------------------------
 
     MinecraftServer getServer(CommandContext<ServerCommandSource> context) {
@@ -435,7 +227,7 @@ public class MiniTeleport implements ModInitializer {
 
             if (player) uuid = getPlayer(context.getSource()).getUuid();
 
-            for (Warp warp : getWarps(getFile(server, uuid))) {
+            for (Warp warp : WarpManager.getWarps(WarpManager.getFile(server, uuid))) {
                 builder.suggest(warp.name());
             }
             return builder.buildFuture();
@@ -466,7 +258,7 @@ public class MiniTeleport implements ModInitializer {
                     ServerPlayerEntity player = getPlayer(context.getSource());
 
                     String homeName = StringArgumentType.getString(context, "name");
-                    setWarp(homeName, player, player.getUuid());
+                    WarpManager.setWarp(homeName, player, player.getUuid());
 
                     player.sendMessage(Text.literal(String.format("Home %s set!", homeName)).formatted(Formatting.AQUA),
                         false);
@@ -475,7 +267,7 @@ public class MiniTeleport implements ModInitializer {
             )
             .executes(context -> {
                 ServerPlayerEntity player = getPlayer(context.getSource());
-                setWarp("home", player, player.getUuid());
+                WarpManager.setWarp("home", player, player.getUuid());
                 player.sendMessage(Text.literal("Home set!").formatted(Formatting.AQUA), false);
                 return 1;
             })
@@ -489,12 +281,12 @@ public class MiniTeleport implements ModInitializer {
                     ServerPlayerEntity player = getPlayer(context.getSource());
 
                     String homeName = StringArgumentType.getString(context, "name");
-                    return delWarp(homeName, player, player.getUuid());
+                    return WarpManager.delWarp(homeName, player, player.getUuid());
                 })
             )
             .executes(context -> {
                 ServerPlayerEntity player = getPlayer(context.getSource());
-                return delWarp("home", player, player.getUuid());
+                return WarpManager.delWarp("home", player, player.getUuid());
             })
         );
 
@@ -505,12 +297,12 @@ public class MiniTeleport implements ModInitializer {
                 .executes(context -> {
                     ServerPlayerEntity player = getPlayer(context.getSource());
                     String homeName = StringArgumentType.getString(context, "name");
-                    return warpPlayer(player, getWarp(getServer(context), homeName, player.getUuid()));
+                    return WarpManager.warpPlayer(player, WarpManager.getWarp(getServer(context), homeName, player.getUuid()));
                 })
             ).executes(context -> {
                 ServerPlayerEntity player = getPlayer(context.getSource());
 
-                return warpPlayer(player, getWarp(getServer(context), "home", player.getUuid()));
+                return WarpManager.warpPlayer(player, WarpManager.getWarp(getServer(context), "home", player.getUuid()));
             })
         );
 
@@ -518,7 +310,7 @@ public class MiniTeleport implements ModInitializer {
             .requires(PERMISSIONS_NORMAL)
             .executes(context -> {
                 ServerPlayerEntity player = getPlayer(context.getSource());
-                player.sendMessage(listWarps(getServer(context), player.getUuid()), false);
+                player.sendMessage(WarpManager.listWarps(getServer(context), player.getUuid()), false);
                 return 1;
             })
         );
@@ -527,7 +319,7 @@ public class MiniTeleport implements ModInitializer {
             .requires(PERMISSIONS_NORMAL)
             .executes(context -> {
                 ServerPlayerEntity player = getPlayer(context.getSource());
-                return warpPlayer(player, getWarp(getServer(context), "back", player.getUuid()));
+                return WarpManager.warpPlayer(player, WarpManager.getWarp(getServer(context), "back", player.getUuid()));
             })
         );
 
@@ -537,7 +329,7 @@ public class MiniTeleport implements ModInitializer {
                 ServerPlayerEntity player = getPlayer(context.getSource());
 
                 String warpName = StringArgumentType.getString(context, "name");
-                setWarp(warpName, player, null);
+                WarpManager.setWarp(warpName, player, null);
 
                 player.sendMessage(Text.literal(String.format("Warp %s set!", warpName)).formatted(Formatting.AQUA),
                     false);
@@ -553,7 +345,7 @@ public class MiniTeleport implements ModInitializer {
                     ServerPlayerEntity player = getPlayer(context.getSource());
 
                     String warpName = StringArgumentType.getString(context, "name");
-                    return delWarp(warpName, player, null);
+                    return WarpManager.delWarp(warpName, player, null);
                 })
             )
         );
@@ -565,7 +357,7 @@ public class MiniTeleport implements ModInitializer {
                 .executes(context -> {
                     ServerPlayerEntity player = getPlayer(context.getSource());
                     String warpName = StringArgumentType.getString(context, "name");
-                    return warpPlayer(player, getWarp(getServer(context), warpName, null));
+                    return WarpManager.warpPlayer(player, WarpManager.getWarp(getServer(context), warpName, null));
                 })
             )
         );
@@ -574,7 +366,7 @@ public class MiniTeleport implements ModInitializer {
             .requires(PERMISSIONS_NORMAL)
             .executes(context -> {
                 ServerPlayerEntity player = getPlayer(context.getSource());
-                player.sendMessage(listWarps(getServer(context), null), false);
+                player.sendMessage(WarpManager.listWarps(getServer(context), null), false);
                 return 1;
             }));
 
@@ -582,7 +374,7 @@ public class MiniTeleport implements ModInitializer {
             .requires(PERMISSIONS_ADMIN)
             .executes(context -> {
                 ServerPlayerEntity player = getPlayer(context.getSource());
-                setWarp("spawn", player, null);
+                WarpManager.setWarp("spawn", player, null);
 
                 ServerWorld world = player.getEntityWorld();
                 world.setSpawnPoint(WorldProperties.SpawnPoint.create(
@@ -591,7 +383,7 @@ public class MiniTeleport implements ModInitializer {
                     0,
                     0
                 ));
-                world.getServer().getGameRules().get(GameRules.SPAWN_RADIUS).set(0, world.getServer());
+                world.getGameRules().setValue(GameRules.RESPAWN_RADIUS, 0, world.getServer());
 
                 player.sendMessage(Text.literal("Spawn set!").formatted(Formatting.AQUA), false);
                 return 1;
@@ -602,7 +394,7 @@ public class MiniTeleport implements ModInitializer {
             .requires(PERMISSIONS_NORMAL)
             .executes(context -> {
                 ServerPlayerEntity player = getPlayer(context.getSource());
-                return warpPlayer(player, getWarp(getServer(context), "spawn", null));
+                return WarpManager.warpPlayer(player, WarpManager.getWarp(getServer(context), "spawn", null));
             })
         );
 
@@ -695,7 +487,9 @@ public class MiniTeleport implements ModInitializer {
             )
         );
     }
+    //endregion
 
+    //region INITIALIZE
     // ------ INITIALIZE ----------------------------------------------------------------------------------
 
     @Override
@@ -706,14 +500,33 @@ public class MiniTeleport implements ModInitializer {
 
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, cause) -> {
             if (entity instanceof ServerPlayerEntity player) {
-                setWarp("back", player, player.getUuid());
+                WarpManager.setWarp("back", player, player.getUuid());
             }
         });
 
-        ServerWorldEvents.LOAD.register((server, world) -> createDir(server));
+        ServerWorldEvents.LOAD.register((server, world) -> {
+            WarpManager.createDir(server);
+        });
 
-        LOGGER.info("Initialized!");
+        // Find appropriate map handler
+        IMapHandler[] mapHandlers = new IMapHandler[] {
+            new Pl3xMapHandler(),
+            new EmptyMapHandler()
+        };
+        for (IMapHandler handler : mapHandlers) {
+            if (handler.modPresent()) {
+                mapHandler = handler;
+                Constants.LOGGER.info("Using map handler for mod: {}", handler.requiredMod());
+                break;
+            }
+        }
+
+        // Initialize map handler on server start
+        ServerLifecycleEvents.SERVER_STARTED.register((server) -> {
+            mapHandler.initialize(server);
+        });
+
+        Constants.LOGGER.info("Initialized!");
     }
-
-    // -----------------------------------------------------------------------------------------------------------
+    // endregion
 }

@@ -18,5 +18,8 @@
     "fabricloader": ">=${loader_version}",
     "fabric": "*",
     "minecraft": "${minecraft_version}"
+  },
+  "suggests": {
+    "pl3xmap": "*"
   }
 }
